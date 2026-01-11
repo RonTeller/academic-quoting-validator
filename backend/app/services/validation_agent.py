@@ -7,8 +7,18 @@ from app.config import get_settings
 
 settings = get_settings()
 
-# Initialize Anthropic client
-client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
+# Lazy initialization of Anthropic client
+_client = None
+
+
+def get_client():
+    """Get or create the Anthropic client."""
+    global _client
+    if _client is None:
+        if not settings.anthropic_api_key or settings.anthropic_api_key.startswith("test"):
+            raise ValueError("Valid ANTHROPIC_API_KEY is required for quote validation")
+        _client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
+    return _client
 
 
 def validate_quote(
@@ -36,6 +46,7 @@ def validate_quote(
         source_text=source_text,
     )
 
+    client = get_client()
     response = client.messages.create(
         model="claude-sonnet-4-20250514",
         max_tokens=2000,

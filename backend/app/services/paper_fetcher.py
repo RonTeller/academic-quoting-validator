@@ -52,17 +52,32 @@ def fetch_from_arxiv(paper: Paper, db: Session) -> bool:
     Download paper from arXiv.
     """
     try:
-        # Search for the paper
-        search = arxiv.Search(
-            id_list=[paper.arxiv_id] if paper.arxiv_id else [],
-            query=paper.title if not paper.arxiv_id else None,
-            max_results=1
-        )
+        client = arxiv.Client()
 
-        for result in search.results():
+        # Search by arXiv ID if available
+        if paper.arxiv_id:
+            # Clean up arXiv ID (remove version suffix if present)
+            arxiv_id = paper.arxiv_id.split('v')[0]
+            search = arxiv.Search(id_list=[arxiv_id])
+        elif paper.title:
+            # Search by title
+            search = arxiv.Search(query=paper.title, max_results=3)
+        else:
+            return False
+
+        for result in client.results(search):
+            # If searching by title, verify it's a reasonable match
+            if not paper.arxiv_id and paper.title:
+                # Simple check: at least some words match
+                title_words = set(paper.title.lower().split())
+                result_words = set(result.title.lower().split())
+                if len(title_words & result_words) < 2:
+                    continue
+
             # Download PDF
             os.makedirs(settings.upload_dir, exist_ok=True)
-            file_path = os.path.join(settings.upload_dir, f"arxiv_{result.entry_id.split('/')[-1]}.pdf")
+            arxiv_id = result.entry_id.split('/')[-1]
+            file_path = os.path.join(settings.upload_dir, f"arxiv_{arxiv_id}.pdf")
 
             result.download_pdf(dirpath=settings.upload_dir, filename=os.path.basename(file_path))
 
@@ -72,12 +87,13 @@ def fetch_from_arxiv(paper: Paper, db: Session) -> bool:
             paper.title = result.title
             paper.authors = ", ".join([a.name for a in result.authors])
             paper.year = result.published.year
-            paper.arxiv_id = result.entry_id.split('/')[-1]
+            paper.arxiv_id = arxiv_id
 
             # Extract text
             paper.extracted_text = extract_text_from_pdf(file_path)
 
             db.commit()
+            print(f"arXiv: Downloaded '{result.title}'")
             return True
 
     except Exception as e:
