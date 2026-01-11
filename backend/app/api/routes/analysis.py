@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, BackgroundTasks
 from sqlalchemy.orm import Session
 from typing import Optional
 import os
@@ -13,8 +13,16 @@ router = APIRouter()
 settings = get_settings()
 
 
+def run_analysis_sync(analysis_id: int, manual_mode: bool = False):
+    """Run analysis synchronously (for testing without Celery/Redis)."""
+    from app.tasks import process_analysis
+    # Call the task function directly (not as Celery task)
+    process_analysis(analysis_id, manual_mode=manual_mode)
+
+
 @router.post("/", response_model=AnalysisResponse)
 async def create_analysis(
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     manual_mode: bool = Form(False),
     db: Session = Depends(get_db),
@@ -63,9 +71,9 @@ async def create_analysis(
     db.commit()
     db.refresh(analysis)
 
-    # TODO: Trigger Celery task to process the paper
-    # from app.tasks import process_analysis
-    # process_analysis.delay(analysis.id, manual_mode=manual_mode)
+    # Trigger background processing
+    # Uses FastAPI BackgroundTasks (works without Redis/Celery)
+    background_tasks.add_task(run_analysis_sync, analysis.id, manual_mode)
 
     return analysis
 
@@ -174,8 +182,18 @@ async def get_missing_papers(analysis_id: int, db: Session = Depends(get_db)):
     }
 
 
+def run_continue_analysis_sync(analysis_id: int):
+    """Continue analysis synchronously after missing papers uploaded."""
+    from app.tasks import validate_quotes_task
+    validate_quotes_task(analysis_id)
+
+
 @router.post("/{analysis_id}/continue")
-async def continue_analysis(analysis_id: int, db: Session = Depends(get_db)):
+async def continue_analysis(
+    analysis_id: int,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+):
     """Continue analysis after uploading missing papers."""
     analysis = db.query(Analysis).filter(Analysis.id == analysis_id).first()
     if not analysis:
@@ -184,11 +202,7 @@ async def continue_analysis(analysis_id: int, db: Session = Depends(get_db)):
     if analysis.status != AnalysisStatus.AWAITING_UPLOADS:
         raise HTTPException(status_code=400, detail="Analysis is not awaiting uploads")
 
-    # TODO: Trigger Celery task to continue processing
-    # from app.tasks import continue_analysis_task
-    # continue_analysis_task.delay(analysis_id)
-
-    analysis.status = AnalysisStatus.VALIDATING
-    db.commit()
+    # Trigger background validation
+    background_tasks.add_task(run_continue_analysis_sync, analysis_id)
 
     return {"message": "Analysis resumed"}

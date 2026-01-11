@@ -4,10 +4,9 @@ from app.models.models import Analysis, Paper, Quote, AnalysisStatus, QuoteStatu
 from typing import Optional
 
 
-@celery_app.task(bind=True)
-def process_analysis(self, analysis_id: int, manual_mode: bool = False):
+def process_analysis(analysis_id: int, manual_mode: bool = False):
     """
-    Main task to process an uploaded paper.
+    Main function to process an uploaded paper.
 
     Steps:
     1. Extract text from uploaded PDF
@@ -107,18 +106,14 @@ def process_analysis(self, analysis_id: int, manual_mode: bool = False):
         return validate_quotes_task(analysis_id)
 
     except Exception as e:
-        analysis.status = AnalysisStatus.FAILED
-        analysis.status_message = str(e)
-        db.commit()
+        analysis = db.query(Analysis).filter(Analysis.id == analysis_id).first()
+        if analysis:
+            analysis.status = AnalysisStatus.FAILED
+            analysis.status_message = str(e)
+            db.commit()
         raise
     finally:
         db.close()
-
-
-@celery_app.task(bind=True)
-def continue_analysis_task(self, analysis_id: int):
-    """Continue analysis after user uploads missing papers."""
-    return validate_quotes_task(analysis_id)
 
 
 def validate_quotes_task(analysis_id: int):
@@ -148,6 +143,7 @@ def validate_quotes_task(analysis_id: int):
                 if not ref_paper or not ref_paper.extracted_text:
                     quote.status = QuoteStatus.FAILED
                     quote.explanation = "Could not find or read the reference paper"
+                    db.commit()
                     continue
 
                 # Validate the quote
@@ -177,9 +173,24 @@ def validate_quotes_task(analysis_id: int):
         return {"status": "completed"}
 
     except Exception as e:
-        analysis.status = AnalysisStatus.FAILED
-        analysis.status_message = str(e)
-        db.commit()
+        analysis = db.query(Analysis).filter(Analysis.id == analysis_id).first()
+        if analysis:
+            analysis.status = AnalysisStatus.FAILED
+            analysis.status_message = str(e)
+            db.commit()
         raise
     finally:
         db.close()
+
+
+# Celery task wrappers (for use with Redis/Celery in production)
+@celery_app.task(bind=True)
+def process_analysis_task(self, analysis_id: int, manual_mode: bool = False):
+    """Celery task wrapper for process_analysis."""
+    return process_analysis(analysis_id, manual_mode)
+
+
+@celery_app.task(bind=True)
+def continue_analysis_celery_task(self, analysis_id: int):
+    """Celery task wrapper for validate_quotes_task."""
+    return validate_quotes_task(analysis_id)
