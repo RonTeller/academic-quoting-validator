@@ -1,6 +1,7 @@
 """Paper Fetcher Service - Downloads reference papers from various sources."""
 
 import os
+import time
 import requests
 import arxiv
 from typing import Optional
@@ -11,6 +12,10 @@ from app.config import get_settings
 from app.services.pdf_processor import extract_text_from_pdf
 
 settings = get_settings()
+
+# Rate limiting for APIs
+_last_semantic_scholar_call = 0
+SEMANTIC_SCHOLAR_MIN_INTERVAL = 1.0  # Minimum seconds between calls
 
 
 def fetch_paper(paper: Paper, db: Session) -> bool:
@@ -131,39 +136,83 @@ def fetch_from_doi(paper: Paper, db: Session) -> bool:
 def fetch_from_semantic_scholar(paper: Paper, db: Session) -> bool:
     """
     Search Semantic Scholar for the paper.
+    Falls back to arXiv if Semantic Scholar returns an arXiv ID but no direct PDF.
     """
+    global _last_semantic_scholar_call
+
     try:
-        # Search by title
+        # Rate limiting
+        elapsed = time.time() - _last_semantic_scholar_call
+        if elapsed < SEMANTIC_SCHOLAR_MIN_INTERVAL:
+            time.sleep(SEMANTIC_SCHOLAR_MIN_INTERVAL - elapsed)
+        _last_semantic_scholar_call = time.time()
+
+        # Search by title or reference text
+        search_query = paper.title or (paper.reference_text[:100] if paper.reference_text else None)
+        if not search_query:
+            return False
+
+        # Clean up the query (remove newlines, extra spaces)
+        search_query = " ".join(search_query.split())
+
         search_url = "https://api.semanticscholar.org/graph/v1/paper/search"
         params = {
-            "query": paper.title or paper.reference_text[:100],
+            "query": search_query,
             "fields": "title,authors,year,openAccessPdf,externalIds",
-            "limit": 1
+            "limit": 3
         }
 
         response = requests.get(search_url, params=params, timeout=10)
 
+        # Handle rate limiting with retry
+        if response.status_code == 429:
+            print("Semantic Scholar: Rate limited, waiting 5 seconds...")
+            time.sleep(5)
+            response = requests.get(search_url, params=params, timeout=10)
+
         if response.status_code == 200:
             data = response.json()
-            if data.get("data"):
-                result = data["data"][0]
+            for result in data.get("data", []):
+                # Verify title match (at least some words overlap)
+                if paper.title:
+                    title_words = set(paper.title.lower().split())
+                    result_words = set(result.get("title", "").lower().split())
+                    if len(title_words & result_words) < 2:
+                        continue
 
-                # Check for open access PDF
+                # Update metadata from Semantic Scholar
+                paper.title = result.get("title")
+                if result.get("authors"):
+                    paper.authors = ", ".join([a["name"] for a in result["authors"]])
+                paper.year = result.get("year")
+
+                external_ids = result.get("externalIds", {})
+                if external_ids.get("DOI"):
+                    paper.doi = external_ids["DOI"]
+                if external_ids.get("ArXiv"):
+                    paper.arxiv_id = external_ids["ArXiv"]
+
+                # Try direct open access PDF first
                 if result.get("openAccessPdf") and result["openAccessPdf"].get("url"):
                     pdf_url = result["openAccessPdf"]["url"]
                     success = download_pdf_from_url(pdf_url, paper, db, PaperSourceType.SEMANTIC_SCHOLAR)
-
                     if success:
-                        # Update metadata
-                        paper.title = result.get("title")
-                        if result.get("authors"):
-                            paper.authors = ", ".join([a["name"] for a in result["authors"]])
-                        paper.year = result.get("year")
-                        if result.get("externalIds", {}).get("DOI"):
-                            paper.doi = result["externalIds"]["DOI"]
-                        if result.get("externalIds", {}).get("ArXiv"):
-                            paper.arxiv_id = result["externalIds"]["ArXiv"]
-                        db.commit()
+                        print(f"Semantic Scholar: Downloaded '{paper.title}'")
+                        return True
+
+                # Fall back to arXiv if we found an arXiv ID
+                if paper.arxiv_id:
+                    print(f"Semantic Scholar: Found arXiv ID {paper.arxiv_id}, trying arXiv...")
+                    db.commit()  # Save metadata first
+                    success = fetch_from_arxiv(paper, db)
+                    if success:
+                        return True
+
+                # Could try DOI via Unpaywall here too
+                if paper.doi and not paper.file_path:
+                    db.commit()
+                    success = fetch_from_doi(paper, db)
+                    if success:
                         return True
 
     except Exception as e:
